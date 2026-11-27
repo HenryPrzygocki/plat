@@ -4,6 +4,8 @@
 use std::os::fd::AsFd;
 use std::path::Path;
 
+use rustix::fs::{Statx, StatxAttributes};
+
 /// What kind of filesystem a mount point leads to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FsClass {
@@ -17,102 +19,72 @@ pub enum FsClass {
     Image,
 }
 
-/// Names of filesystem types, indexed by the id stored on skipped mount nodes.
-const NAMES: &[&str] = &[
-    "other fs",
-    "proc",
-    "sysfs",
-    "tmpfs",
-    "devpts",
-    "cgroup",
-    "debugfs",
-    "tracefs",
-    "securityfs",
-    "pstore",
-    "bpf",
-    "configfs",
-    "fusectl",
-    "hugetlbfs",
-    "mqueue",
-    "efivarfs",
-    "binfmt_misc",
-    "autofs",
-    "rpc_pipefs",
-    "nsfs",
-    "selinuxfs",
-    "ramfs",
-    "overlay",
-    "squashfs",
-    "iso9660",
-    "udf",
-    "erofs",
-    "nfs",
-    "smb",
-    "cifs",
-    "fuse",
-    "9p",
-    "ceph",
-    "ext",
-    "xfs",
-    "btrfs",
-    "vfat",
-    "exfat",
-    "ntfs",
-    "f2fs",
-    "zfs",
-    "bcachefs",
+/// Filesystem types: display name, class, and the `statfs` magic numbers that
+/// identify it. An id stored on a node is an index into this table.
+const TYPES: &[(&str, FsClass, &[u64])] = &[
+    // Fixed ids first: see the constants below.
+    ("other fs", FsClass::Disk, &[]),
+    ("bind", FsClass::Image, &[]),
+    ("duplicate", FsClass::Image, &[]),
+    ("proc", FsClass::Virtual, &[0x9fa0]),
+    ("sysfs", FsClass::Virtual, &[0x6265_6572]),
+    ("tmpfs", FsClass::Virtual, &[0x0102_1994]),
+    ("devpts", FsClass::Virtual, &[0x1cd1]),
+    ("cgroup", FsClass::Virtual, &[0x0027_e0eb, 0x6367_7270]),
+    ("debugfs", FsClass::Virtual, &[0x6462_6720]),
+    ("tracefs", FsClass::Virtual, &[0x7472_6163]),
+    ("securityfs", FsClass::Virtual, &[0x7363_6673]),
+    ("pstore", FsClass::Virtual, &[0x6165_676c]),
+    ("bpf", FsClass::Virtual, &[0xcafe_4a11]),
+    ("configfs", FsClass::Virtual, &[0x6265_6570]),
+    ("fusectl", FsClass::Virtual, &[0x6573_5543]),
+    ("hugetlbfs", FsClass::Virtual, &[0x9584_58f6]),
+    ("mqueue", FsClass::Virtual, &[0x1980_0202]),
+    ("efivarfs", FsClass::Virtual, &[0xde5e_81e4]),
+    ("binfmt_misc", FsClass::Virtual, &[0x4249_4e4d]),
+    ("autofs", FsClass::Virtual, &[0x0187]),
+    ("rpc_pipefs", FsClass::Virtual, &[0x6759_6969]),
+    ("nsfs", FsClass::Virtual, &[0x6e73_6673]),
+    ("selinuxfs", FsClass::Virtual, &[0xf97c_ff8c]),
+    ("ramfs", FsClass::Virtual, &[0x8584_58f6]),
+    ("overlay", FsClass::Image, &[0x794c_7630]),
+    ("squashfs", FsClass::Image, &[0x7371_7368]),
+    ("iso9660", FsClass::Image, &[0x9660]),
+    ("udf", FsClass::Image, &[0x1501_3346]),
+    ("erofs", FsClass::Image, &[0xe0f5_e1e2]),
+    ("nfs", FsClass::Remote, &[0x6969]),
+    ("smb", FsClass::Remote, &[0x517b, 0xfe53_4d42]),
+    ("cifs", FsClass::Remote, &[0xff53_4d42]),
+    ("fuse", FsClass::Remote, &[0x6573_5546]),
+    ("9p", FsClass::Remote, &[0x0102_1997]),
+    ("ceph", FsClass::Remote, &[0x00c3_6400]),
+    ("ext", FsClass::Disk, &[0xef53]),
+    ("xfs", FsClass::Disk, &[0x5846_5342]),
+    ("btrfs", FsClass::Disk, &[0x9123_683e]),
+    ("vfat", FsClass::Disk, &[0x4d44]),
+    ("exfat", FsClass::Disk, &[0x2011_bab0]),
+    ("ntfs", FsClass::Disk, &[0x5346_544e, 0x7366_746e]),
+    ("f2fs", FsClass::Disk, &[0xf2f5_2010]),
+    ("zfs", FsClass::Disk, &[0x2fc1_2fc1]),
+    ("bcachefs", FsClass::Disk, &[0xca45_1a4e]),
 ];
 
-/// Classify a filesystem by its `statfs` magic number. Returns the class and an
-/// index into the name table.
+/// A filesystem the table does not know. Treated as a real disk.
+pub const OTHER: u16 = 0;
+/// A mount whose device number is that of its surroundings: a directory of
+/// the same filesystem made visible at a second place.
+pub const BIND: u16 = 1;
+/// A mount of something the scan already covers at another place.
+pub const DUPLICATE: u16 = 2;
+
+/// Classify a filesystem by its `statfs` magic number. Returns the class and
+/// an id for [`fs_name`]. Unknown types are treated as real disks, so that
+/// nothing is hidden by mistake.
 fn classify(magic: u64) -> (FsClass, u16) {
-    use FsClass::*;
-    let (class, name) = match magic {
-        0x9fa0 => (Virtual, "proc"),
-        0x6265_6572 => (Virtual, "sysfs"),
-        0x0102_1994 => (Virtual, "tmpfs"),
-        0x1cd1 => (Virtual, "devpts"),
-        0x0027_e0eb | 0x6367_7270 => (Virtual, "cgroup"),
-        0x6462_6720 => (Virtual, "debugfs"),
-        0x7472_6163 => (Virtual, "tracefs"),
-        0x7363_6673 => (Virtual, "securityfs"),
-        0x6165_676c => (Virtual, "pstore"),
-        0xcafe_4a11 => (Virtual, "bpf"),
-        0x6265_6570 => (Virtual, "configfs"),
-        0x6573_5543 => (Virtual, "fusectl"),
-        0x9584_58f6 => (Virtual, "hugetlbfs"),
-        0x1980_0202 => (Virtual, "mqueue"),
-        0xde5e_81e4 => (Virtual, "efivarfs"),
-        0x4249_4e4d => (Virtual, "binfmt_misc"),
-        0x0187 => (Virtual, "autofs"),
-        0x6759_6969 => (Virtual, "rpc_pipefs"),
-        0x6e73_6673 => (Virtual, "nsfs"),
-        0xf97c_ff8c => (Virtual, "selinuxfs"),
-        0x8584_58f6 => (Virtual, "ramfs"),
-        0x794c_7630 => (Image, "overlay"),
-        0x7371_7368 => (Image, "squashfs"),
-        0x9660 => (Image, "iso9660"),
-        0x1501_3346 => (Image, "udf"),
-        0xe0f5_e1e2 => (Image, "erofs"),
-        0x6969 => (Remote, "nfs"),
-        0x517b | 0xfe53_4d42 => (Remote, "smb"),
-        0xff53_4d42 => (Remote, "cifs"),
-        0x6573_5546 => (Remote, "fuse"),
-        0x0102_1997 => (Remote, "9p"),
-        0x00c3_6400 => (Remote, "ceph"),
-        0xef53 => (Disk, "ext"),
-        0x5846_5342 => (Disk, "xfs"),
-        0x9123_683e => (Disk, "btrfs"),
-        0x4d44 => (Disk, "vfat"),
-        0x2011_bab0 => (Disk, "exfat"),
-        0x5346_544e | 0x7366_746e => (Disk, "ntfs"),
-        0xf2f5_2010 => (Disk, "f2fs"),
-        0x2fc1_2fc1 => (Disk, "zfs"),
-        0xca45_1a4e => (Disk, "bcachefs"),
-        _ => (Disk, "other fs"),
-    };
-    let id = NAMES.iter().position(|&n| n == name).unwrap_or(0) as u16;
-    (class, id)
+    TYPES
+        .iter()
+        .position(|(_, _, magics)| magics.contains(&magic))
+        .map_or((FsClass::Disk, OTHER), |i| (TYPES[i].1, i as u16))
 }
 
 /// Classify the filesystem an open descriptor is on. Unknown or unreadable
@@ -120,13 +92,28 @@ fn classify(magic: u64) -> (FsClass, u16) {
 pub fn classify_fd(fd: impl AsFd) -> (FsClass, u16) {
     match rustix::fs::fstatfs(fd) {
         Ok(st) => classify(st.f_type as u64 & 0xffff_ffff),
-        Err(_) => (FsClass::Disk, 0),
+        Err(_) => (FsClass::Disk, OTHER),
     }
 }
 
 /// Name of a filesystem type id as returned by [`classify_fd`].
 pub fn fs_name(id: u16) -> &'static str {
-    NAMES.get(id as usize).copied().unwrap_or(NAMES[0])
+    TYPES.get(id as usize).unwrap_or(&TYPES[OTHER as usize]).0
+}
+
+/// One device number from the two halves `statx` reports. Everything that
+/// compares devices uses this, so the encoding never has to match `st_dev`.
+pub fn dev_of(stx: &Statx) -> u64 {
+    (stx.stx_dev_major as u64) << 32 | stx.stx_dev_minor as u64
+}
+
+/// True when the entry is the root of a mount. This is what tells a bind
+/// mount apart: it has the device number of the filesystem it comes from.
+/// Kernels before 5.8 do not report the attribute; there only a change of
+/// device marks a mount.
+pub fn is_mount_root(stx: &Statx) -> bool {
+    stx.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT)
+        && stx.stx_attributes.contains(StatxAttributes::MOUNT_ROOT)
 }
 
 /// Capacity of the filesystem holding `path`: (total bytes, bytes available to
@@ -149,13 +136,25 @@ mod tests {
 
     #[test]
     fn every_name_resolves() {
-        assert_eq!(classify(0x9fa0), (FsClass::Virtual, 1));
+        assert_eq!(fs_name(classify(0x9fa0).1), "proc");
+        assert_eq!(classify(0x9fa0).0, FsClass::Virtual);
         assert_eq!(fs_name(classify(0x0102_1994).1), "tmpfs");
+        assert_eq!(fs_name(classify(0xfe53_4d42).1), "smb");
         assert_eq!(fs_name(classify(0x6969).1), "nfs");
         assert_eq!(fs_name(classify(0x5846_5342).1), "xfs");
         assert_eq!(classify(0x5846_5342).0, FsClass::Disk);
-        assert_eq!(classify(0x1234_5678), (FsClass::Disk, 0));
+        assert_eq!(classify(0x1234_5678), (FsClass::Disk, OTHER));
+        assert_eq!(fs_name(OTHER), "other fs");
+        assert_eq!(fs_name(BIND), "bind");
+        assert_eq!(fs_name(DUPLICATE), "duplicate");
+        assert_eq!(fs_name(u16::MAX), "other fs");
         let proc = std::fs::File::open("/proc").unwrap();
-        assert_eq!(classify_fd(&proc), (FsClass::Virtual, 1));
+        assert_eq!(fs_name(classify_fd(&proc).1), "proc");
+        // No magic number is claimed twice.
+        let mut all: Vec<u64> = TYPES.iter().flat_map(|t| t.2.iter().copied()).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n);
     }
 }

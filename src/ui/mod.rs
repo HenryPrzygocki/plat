@@ -242,8 +242,7 @@ mod tests {
     }
 
     fn fixture(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("plat-ui-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = crate::testutil::scratch(tag);
         let mut size = 3usize;
         for a in 0..5 {
             for b in 0..4 {

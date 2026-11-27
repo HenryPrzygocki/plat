@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
-use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Statx, StatxFlags};
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, StatxFlags};
 
 use crate::ext;
-use crate::fsinfo::{self, FsClass};
+use crate::fsinfo::{self, FsClass, dev_of};
 use crate::tree::flag;
 
 /// Marker for "this entry has no scanned subdirectory".
@@ -92,6 +92,9 @@ struct Ctx<'a> {
     progress: &'a Progress,
     /// (device, inode) of every multiply-linked file seen so far.
     hardlinks: Mutex<FxHashSet<(u64, u64)>>,
+    /// (device, inode) of the scan root and of every mount entered, so that
+    /// a filesystem reachable at two places is only entered at one.
+    entered: Mutex<FxHashSet<(u64, u64)>>,
 }
 
 /// How entries are stat'ed: never through a symlink, and never in a way that
@@ -100,11 +103,6 @@ struct Ctx<'a> {
 /// reports the trigger directory itself, which then shows up as an autofs
 /// mount and is skipped.
 const STAT_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
-
-/// One device number from the two halves `statx` reports.
-fn dev_of(stx: &Statx) -> u64 {
-    (stx.stx_dev_major as u64) << 32 | stx.stx_dev_minor as u64
-}
 
 /// Scan `root` and everything below it. `root` must be a directory.
 pub fn scan(root: &Path, opts: Options, progress: &Progress) -> io::Result<(RootMeta, RawDir)> {
@@ -120,6 +118,7 @@ pub fn scan(root: &Path, opts: Options, progress: &Progress) -> io::Result<(Root
         opts,
         progress,
         hardlinks: Mutex::new(FxHashSet::default()),
+        entered: Mutex::new(FxHashSet::from_iter([(dev_of(&stx), stx.stx_ino)])),
     };
     let dir = scan_dir(root, None, &ctx);
     let meta = RootMeta {
@@ -156,7 +155,9 @@ fn scan_dir(path: &Path, dev: Option<u64>, ctx: &Ctx) -> RawDir {
         ctx.progress.errors.fetch_add(1, Relaxed);
         out
     };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // Every path here is canonical, so a symlink at the end means the
+    // directory was swapped for one since its parent was read.
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let Ok(fd) = rustix::fs::open(path, flags, Mode::empty()) else {
         return unreadable(out);
     };
@@ -232,12 +233,25 @@ fn scan_dir(path: &Path, dev: Option<u64>, ctx: &Ctx) -> RawDir {
         match FileType::from_raw_mode(stx.stx_mode as u32) {
             FileType::Directory => {
                 e.flags = flag::DIR;
-                if dev_of(&stx) == dev {
+                let here = dev_of(&stx);
+                if here == dev && !fsinfo::is_mount_root(&stx) {
                     pending.push((index as u32, Some(dev)));
                 } else {
                     e.flags |= flag::MOUNT;
-                    let (class, fs_id) = classify_entry(dirfd, name_os);
-                    let skip = ctx.opts.one_fs || (class != FsClass::Disk && !ctx.opts.all_mounts);
+                    // A mount on the same device is a bind mount: part of a
+                    // filesystem shown a second time, and counted where it
+                    // is stored.
+                    let (class, mut fs_id) = if here == dev {
+                        (FsClass::Image, fsinfo::BIND)
+                    } else {
+                        classify_entry(dirfd, name_os)
+                    };
+                    let mut skip =
+                        ctx.opts.one_fs || (class != FsClass::Disk && !ctx.opts.all_mounts);
+                    if !skip && !ctx.entered.lock().unwrap().insert((here, stx.stx_ino)) {
+                        skip = true;
+                        fs_id = fsinfo::DUPLICATE;
+                    }
                     // The filesystem type is kept either way, for display.
                     e.ext = fs_id;
                     if skip {
@@ -373,16 +387,10 @@ pub fn default_threads() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{mount, scratch, umount};
     use crate::tree::{Node, Tree};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
-
-    fn fixture(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("plat-scan-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
-    }
 
     fn scan_tree(root: &Path) -> (Tree, u64) {
         let progress = Progress::default();
@@ -400,7 +408,7 @@ mod tests {
 
     #[test]
     fn hard_links_are_counted_once() {
-        let root = fixture("links");
+        let root = scratch("links");
         fs::write(root.join("original"), vec![1u8; 50_000]).unwrap();
         fs::hard_link(root.join("original"), root.join("second-name")).unwrap();
         fs::hard_link(root.join("original"), root.join("third-name")).unwrap();
@@ -422,8 +430,8 @@ mod tests {
 
     #[test]
     fn symlinks_are_not_followed() {
-        let root = fixture("symlinks");
-        let outside = fixture("symlinks-outside");
+        let root = scratch("symlinks");
+        let outside = scratch("symlinks-outside");
         fs::write(outside.join("big"), vec![1u8; 300_000]).unwrap();
         fs::create_dir(root.join("real")).unwrap();
         fs::write(root.join("real/file"), vec![1u8; 1_000]).unwrap();
@@ -447,7 +455,7 @@ mod tests {
 
     #[test]
     fn unreadable_directories_are_flagged_all_the_way_up() {
-        let root = fixture("denied");
+        let root = scratch("denied");
         fs::create_dir_all(root.join("outer/locked")).unwrap();
         fs::write(root.join("outer/locked/secret"), vec![1u8; 5_000]).unwrap();
         fs::write(root.join("outer/visible"), vec![1u8; 2_000]).unwrap();
@@ -477,19 +485,10 @@ mod tests {
     #[test]
     #[ignore = "run under `unshare -Urm`"]
     fn mount_rules_decide_what_is_entered() {
-        let root = fixture("mounts");
+        let root = scratch("mounts");
         fs::create_dir_all(root.join("ram")).unwrap();
         fs::write(root.join("on-disk"), vec![1u8; 3_000]).unwrap();
-        let ok = std::process::Command::new("mount")
-            .args(["-t", "tmpfs", "none"])
-            .arg(root.join("ram"))
-            .status()
-            .unwrap()
-            .success();
-        assert!(
-            ok,
-            "could not mount a tmpfs; is this inside `unshare -Urm`?"
-        );
+        mount(&["-t", "tmpfs", "none"], &root.join("ram"));
         fs::write(root.join("ram/inside"), vec![1u8; 9_000]).unwrap();
 
         let run = |opts: Options| {
@@ -520,13 +519,52 @@ mod tests {
         });
         assert!(node(&tree, &root, "ram").has(flag::SKIPPED));
 
-        assert!(
-            std::process::Command::new("umount")
-                .arg(root.join("ram"))
-                .status()
-                .unwrap()
-                .success()
-        );
+        umount(&root.join("ram"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+    /// Needs a private mount namespace, like the test above.
+    #[test]
+    #[ignore = "run under `unshare -Urm`"]
+    fn mount_aliases_are_not_counted_twice() {
+        let root = scratch("aliases");
+        for d in ["real", "bind", "ram", "ram-again"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        fs::write(root.join("real/data"), vec![1u8; 40_000]).unwrap();
+        mount(&["--bind", root.join("real").to_str().unwrap()], &root.join("bind"));
+        mount(&["-t", "tmpfs", "none"], &root.join("ram"));
+        fs::write(root.join("ram/inside"), vec![1u8; 9_000]).unwrap();
+        mount(&["--bind", root.join("ram").to_str().unwrap()], &root.join("ram-again"));
+        let run = |opts: Options| {
+            let progress = Progress::default();
+            let (meta, raw) = scan(&root, opts, &progress).unwrap();
+            Tree::build(root.clone(), meta, raw).unwrap()
+        };
+        let named = |tree: &Tree, name: &[u8]| {
+            (0..tree.len() as u32)
+                .filter(|&i| tree.name(i) == name)
+                .count()
+        };
+
+        // A directory bound elsewhere on the same filesystem shares its
+        // device number, but it is a mount all the same, and not entered.
+        let tree = run(Options::default());
+        let bind = node(&tree, &root, "bind");
+        assert!(bind.has(flag::MOUNT) && bind.has(flag::SKIPPED), "{:#x}", bind.flags);
+        assert_eq!(fsinfo::fs_name(bind.ext), "bind");
+        assert_eq!(named(&tree, b"data"), 1);
+
+        // Even with every mount included, a filesystem reachable at two
+        // places is entered at one of them only.
+        let tree = run(Options {
+            all_mounts: true,
+            ..Options::default()
+        });
+        assert_eq!(named(&tree, b"inside"), 1);
+
+        for d in ["ram-again", "ram", "bind"] {
+            umount(&root.join(d));
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

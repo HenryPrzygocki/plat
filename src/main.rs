@@ -8,6 +8,8 @@ mod guard;
 mod ops;
 mod scan;
 mod snapshot;
+#[cfg(test)]
+mod testutil;
 mod theme;
 mod tree;
 mod treemap;

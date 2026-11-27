@@ -56,8 +56,11 @@ plat [OPTIONS] [PATH]
 
 By default a scan crosses onto other real filesystems (a separate `/home`,
 say) and skips virtual ones (procfs, sysfs, tmpfs), network and FUSE mounts,
-and read-only images (squashfs, overlay). Skipped mounts stay visible in the
-list, labelled with their type.
+read-only images (squashfs, overlay), and bind mounts, whose contents are
+stored, and counted, somewhere else. Skipped mounts stay visible in the list,
+labelled with their type. A filesystem that can be reached at two places
+inside the scan (a btrfs top level mounted next to its own subvolumes, for
+one) is entered at one of them only, even with `--all-mounts`.
 
 Scanning never mounts anything. An automount point that is not mounted yet
 (an `x-systemd.automount` entry in fstab, for instance) is listed as an
@@ -120,7 +123,9 @@ move to trash, or delete permanently.
   symlink, including one swapped in while it runs.
 - It refuses to cross onto another filesystem. A mount point (or btrfs
   subvolume) inside a doomed directory is left alone with everything on it,
-  and the dialog will not accept a mount point itself.
+  and the dialog will not accept a mount point itself. That includes bind
+  mounts, which share the device number of where they come from and are
+  recognised by asking the kernel whether a directory is a mount root.
 - Read-only directories you own (Go's module cache, for one) are made
   writable and removed, where `rm -rf` would stop.
 - If part of a directory cannot be removed, a report names what was in the
@@ -205,7 +210,7 @@ plat --snapshot 160x48 --keys "j enter 2" PATH   # one frame as ANSI text
 `click:X,Y`, ...) and prints the resulting screen. It refuses to delete
 anything outside the system temp directory.
 
-Three tests are ignored by default because of what they need:
+Five tests are ignored by default because of what they need:
 
 ```sh
 # mount rules for scanning and deleting: need a private mount namespace

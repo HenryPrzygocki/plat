@@ -17,8 +17,21 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, mpsc};
 
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Statx, StatxFlags};
 use rustix::io::Errno;
+
+use crate::fsinfo::{dev_of, is_mount_root};
+
+/// Entries are looked at without following a symlink or triggering an
+/// automount.
+const STAT_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
+
+/// What a mount point inside a doomed directory is told.
+const LEFT_ALONE: &str = "a mount point or subvolume, left alone with everything on it";
+
+fn stat_fd(fd: impl AsFd) -> Result<Statx, Errno> {
+    rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)
+}
 
 /// Why something could not be deleted.
 #[derive(Debug)]
@@ -95,9 +108,7 @@ pub fn remove(path: &Path, counters: &Counters) -> Result<(), Failure> {
     };
     let name = CString::new(name.as_bytes()).map_err(|_| whole("invalid name".into()))?;
     let dir = open_beneath_root(parent).map_err(|e| whole(describe(e)))?;
-    let dev = rustix::fs::fstat(&dir)
-        .map_err(|e| whole(describe(e)))?
-        .st_dev;
+    let dev = dev_of(&stat_fd(&dir).map_err(|e| whole(describe(e)))?);
     remove_entry(dir.as_fd(), &name, dev, counters).map_err(|f| Failure {
         // Report the full path of whatever was in the way.
         path: parent.join(f.path),
@@ -134,14 +145,19 @@ fn remove_dir(
     counters: &Counters,
 ) -> Result<(), Failure> {
     let fail = |e: Errno| Failure::at(name, describe(e));
+    // Look before opening: opening an automount point would mount it. A
+    // bind mount keeps the device number of where it comes from, so the
+    // device alone does not show every mount.
+    let seen = rustix::fs::statx(parent, name, STAT_FLAGS, StatxFlags::BASIC_STATS).map_err(fail)?;
+    if dev_of(&seen) != dev || is_mount_root(&seen) {
+        return Err(Failure::at(name, LEFT_ALONE));
+    }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = rustix::fs::openat(parent, name, flags, Mode::empty()).map_err(fail)?;
-    let st = rustix::fs::fstat(&fd).map_err(fail)?;
-    if st.st_dev != dev {
-        return Err(Failure::at(
-            name,
-            "on another filesystem (mount point or subvolume), left alone",
-        ));
+    // And check that what was opened is what was looked at.
+    let st = stat_fd(&fd).map_err(fail)?;
+    if (dev_of(&st), st.stx_ino) != (dev, seen.stx_ino) || is_mount_root(&st) {
+        return Err(Failure::at(name, describe(Errno::NOTDIR)));
     }
 
     let mut first_failure: Option<Failure> = None;
@@ -173,7 +189,7 @@ fn remove_dir(
                     && f.path.components().count() == 1
                 {
                     made_writable = true;
-                    let mode = Mode::from_raw_mode(st.st_mode) | Mode::RWXU;
+                    let mode = Mode::from_raw_mode(st.stx_mode as u32) | Mode::RWXU;
                     if rustix::fs::fchmod(&fd, mode).is_ok() {
                         result = attempt(counters);
                     }
@@ -347,20 +363,13 @@ pub fn raise_fd_limit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{mount, scratch, umount};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    /// A fresh, empty directory under the system temp dir.
-    fn fixture(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("plat-ops-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
-    }
-
     #[test]
     fn removes_a_tree_and_counts_entries() {
-        let root = fixture("tree");
+        let root = scratch("tree");
         let victim = root.join("victim");
         fs::create_dir_all(victim.join("a/b/c")).unwrap();
         fs::write(victim.join("a/one"), b"1").unwrap();
@@ -379,7 +388,7 @@ mod tests {
 
     #[test]
     fn removes_a_single_file() {
-        let root = fixture("file");
+        let root = scratch("file");
         let file = root.join("only");
         fs::write(&file, b"x").unwrap();
         remove(&file, &Counters::default()).unwrap();
@@ -389,7 +398,7 @@ mod tests {
 
     #[test]
     fn never_follows_symlinks() {
-        let root = fixture("links");
+        let root = scratch("links");
         let outside = root.join("outside");
         fs::create_dir_all(outside.join("deep")).unwrap();
         fs::write(outside.join("sentinel"), b"alive").unwrap();
@@ -417,7 +426,7 @@ mod tests {
 
     #[test]
     fn refuses_a_path_through_a_symlink() {
-        let root = fixture("via-link");
+        let root = scratch("via-link");
         let real = root.join("real");
         fs::create_dir_all(real.join("inner")).unwrap();
         fs::write(real.join("inner/file"), b"x").unwrap();
@@ -432,7 +441,7 @@ mod tests {
 
     #[test]
     fn clears_read_only_directories() {
-        let root = fixture("readonly");
+        let root = scratch("readonly");
         let victim = root.join("victim");
         fs::create_dir_all(victim.join("locked/deeper")).unwrap();
         fs::write(victim.join("locked/file"), b"x").unwrap();
@@ -450,23 +459,13 @@ mod tests {
     #[test]
     #[ignore = "run under `unshare -Urm`"]
     fn refuses_to_cross_a_mount() {
-        use std::process::Command;
-        let root = fixture("mount");
+        let root = scratch("mount");
         let victim = root.join("victim");
         let mnt = victim.join("mnt");
         fs::create_dir_all(victim.join("plain")).unwrap();
         fs::create_dir_all(&mnt).unwrap();
         fs::write(victim.join("plain/file"), b"x").unwrap();
-        let ok = Command::new("mount")
-            .args(["-t", "tmpfs", "none"])
-            .arg(&mnt)
-            .status()
-            .unwrap()
-            .success();
-        assert!(
-            ok,
-            "could not mount a tmpfs; is this inside `unshare -Urm`?"
-        );
+        mount(&["-t", "tmpfs", "none"], &mnt);
         fs::create_dir_all(mnt.join("inner")).unwrap();
         fs::write(mnt.join("inner/sentinel"), b"alive").unwrap();
 
@@ -474,16 +473,47 @@ mod tests {
         // rest is removed.
         let err = remove(&victim, &Counters::default()).unwrap_err();
         assert_eq!(err.path, mnt);
-        assert!(err.reason.contains("another filesystem"), "{}", err.reason);
+        assert_eq!(err.reason, LEFT_ALONE);
         assert_eq!(fs::read(mnt.join("inner/sentinel")).unwrap(), b"alive");
         assert!(!victim.join("plain").exists());
 
         // The mount point itself as the item.
         let err = remove(&mnt, &Counters::default()).unwrap_err();
-        assert!(err.reason.contains("another filesystem"), "{}", err.reason);
+        assert_eq!(err.reason, LEFT_ALONE);
         assert_eq!(fs::read(mnt.join("inner/sentinel")).unwrap(), b"alive");
 
-        assert!(Command::new("umount").arg(&mnt).status().unwrap().success());
+        umount(&mnt);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A bind mount has the device number of the filesystem it comes from, so
+    /// it passes for an ordinary directory unless the kernel is asked.
+    /// Needs a private mount namespace, like the test above.
+    #[test]
+    #[ignore = "run under `unshare -Urm`"]
+    fn refuses_to_enter_a_bind_mount() {
+        let root = scratch("bind");
+        let real = root.join("real");
+        fs::create_dir_all(real.join("inner")).unwrap();
+        fs::write(real.join("inner/sentinel"), b"alive").unwrap();
+        let victim = root.join("victim");
+        let alias = victim.join("alias");
+        fs::create_dir_all(&alias).unwrap();
+        fs::write(victim.join("plain"), b"x").unwrap();
+        mount(&["--bind", real.to_str().unwrap()], &alias);
+
+        // Inside a doomed directory: the rest goes, the bind mount stays.
+        let err = remove(&victim, &Counters::default()).unwrap_err();
+        assert_eq!(err.path, alias);
+        assert_eq!(fs::read(real.join("inner/sentinel")).unwrap(), b"alive");
+        assert!(!victim.join("plain").exists());
+
+        // The bind mount itself as the item.
+        let err = remove(&alias, &Counters::default()).unwrap_err();
+        assert!(err.reason.to_string().contains("mount point"), "{}", err.reason);
+        assert_eq!(fs::read(real.join("inner/sentinel")).unwrap(), b"alive");
+
+        umount(&alias);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -523,7 +553,7 @@ mod tests {
 
     #[test]
     fn reports_the_entry_that_failed() {
-        let root = fixture("missing");
+        let root = scratch("missing");
         let err = remove(&root.join("nope"), &Counters::default()).unwrap_err();
         assert_eq!(err.path, root.join("nope"));
         assert_eq!(err.reason, "no longer exists");
@@ -532,7 +562,7 @@ mod tests {
 
     #[test]
     fn cancel_stops_before_touching_anything() {
-        let root = fixture("cancel");
+        let root = scratch("cancel");
         let victim = root.join("victim");
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("file"), b"x").unwrap();

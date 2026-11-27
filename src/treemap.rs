@@ -383,8 +383,7 @@ mod tests {
     /// of magnitude, several levels deep.
     fn sample_tree(tag: &str) -> (Tree, std::path::PathBuf) {
         use std::fs;
-        let root = std::env::temp_dir().join(format!("plat-map-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = crate::testutil::scratch(tag);
         let mut size = 7usize;
         for a in 0..6 {
             for b in 0..5 {
