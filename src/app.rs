@@ -767,10 +767,14 @@ impl App {
         }
         if n.has(flag::SKIPPED) {
             let fs = fsinfo::fs_name(n.ext);
-            self.toast(
-                format!("{fs} mount, not scanned (start with --all-mounts to include it)"),
-                ToastKind::Info,
-            );
+            let text = if n.ext == fsinfo::DUPLICATE {
+                "the same files are already counted at another place in this scan".to_string()
+            } else if self.opts.one_fs {
+                format!("{fs} mount, not scanned (plat was started with --one-file-system)")
+            } else {
+                format!("{fs} mount, not scanned (start with --all-mounts to include it)")
+            };
+            self.toast(text, ToastKind::Info);
             return;
         }
         if n.has(flag::ERR) && n.desc == 0 {
@@ -1303,10 +1307,20 @@ impl App {
 
     // ------------------------------------------------------------------- input
 
+    /// Bring the lists and the map layout in line with the tree and the view.
+    /// Drawing does this as well, but several events can be handled between
+    /// two frames, and each has to act on what is current rather than on
+    /// what was drawn last: after a deletion, old ids point at other nodes.
+    fn sync(&mut self) {
+        self.prepare();
+        self.ensure_layout(self.hit.map);
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Effect {
         if key.kind == KeyEventKind::Release {
             return Effect::None;
         }
+        self.sync();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return Effect::Quit;
@@ -1527,6 +1541,7 @@ impl App {
         if self.modal.is_some() || self.tree.is_none() {
             return Effect::None;
         }
+        self.sync();
         let (x, y) = (ev.column, ev.row);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1632,20 +1647,9 @@ fn cmp_names(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::with_files;
     use std::fs;
     use std::path::Path;
-
-    /// Build a throwaway directory tree: `(relative path, size in bytes)`.
-    fn fixture(tag: &str, files: &[(&str, usize)]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("plat-app-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        for (rel, size) in files {
-            let path = root.join(rel);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, vec![b'x'; *size]).unwrap();
-        }
-        root.canonicalize().unwrap()
-    }
 
     fn app_for(root: &Path) -> App {
         let mut app = App::new(
@@ -1768,7 +1772,7 @@ mod tests {
 
     #[test]
     fn marks_follow_their_paths_through_a_rescan() {
-        let root = fixture(
+        let root = with_files(
             "rescan",
             &[
                 ("a/one", 5000),
@@ -1809,7 +1813,7 @@ mod tests {
 
     #[test]
     fn deleting_marked_items_updates_disk_and_tree() {
-        let root = fixture(
+        let root = with_files(
             "delete",
             &[
                 ("big/blob", 50_000),
@@ -1850,9 +1854,51 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Events that arrive together are all handled before the next frame, so
+    /// nothing a key acts on may depend on a frame having been drawn.
+    #[test]
+    fn keys_in_one_batch_act_on_what_is_current() {
+        let root = with_files(
+            "batch",
+            &[
+                ("gone/a", 30_000),
+                ("gone/b", 29_000),
+                ("gone/c", 28_000),
+                ("keep/x", 9_000),
+                ("keep/y", 8_000),
+            ],
+        );
+        let mut app = app_for(&root);
+        // One frame: the map laid out, the largest files listed.
+        let map = Rect::new(0, 0, 80, 30);
+        app.hit.map = map;
+        app.ensure_layout(map);
+        key(&mut app, KeyCode::Char('2'));
+        app.prepare();
+        app.largest_sel = 2;
+
+        // No frame from here on. Delete `gone`, which renumbers everything.
+        key(&mut app, KeyCode::Char('1'));
+        app.cursor = id(&app, &root, "gone");
+        key(&mut app, KeyCode::Char('d'));
+        key(&mut app, KeyCode::BackTab);
+        key(&mut app, KeyCode::Enter);
+        assert!(!root.join("gone").exists());
+
+        // The largest files are the ones that are left.
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(marked(&app, &root), ["keep/y"]);
+        // The map moves among the tiles of what is on view now.
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Down);
+        assert!(app.rows.contains(&app.cursor), "cursor {}", app.cursor);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn deleting_the_directory_on_view_moves_up() {
-        let root = fixture("view", &[("outer/inner/file", 3000), ("other", 10)]);
+        let root = with_files("view", &[("outer/inner/file", 3000), ("other", 10)]);
         let mut app = app_for(&root);
         let (outer, inner) = (id(&app, &root, "outer"), id(&app, &root, "outer/inner"));
         app.toggle_mark(outer);
@@ -1870,7 +1916,7 @@ mod tests {
 
     #[test]
     fn a_partial_failure_is_reported_and_rescanned() {
-        let root = fixture(
+        let root = with_files(
             "partial",
             &[("dir/removable", 2000), ("dir/pinned/file", 2000)],
         );
@@ -1910,7 +1956,7 @@ mod tests {
 
     #[test]
     fn nothing_is_deleted_when_deletion_is_disabled() {
-        let root = fixture("gate", &[("precious", 100)]);
+        let root = with_files("gate", &[("precious", 100)]);
         for read_only in [true, false] {
             let mut app = app_for(&root);
             app.read_only = read_only;
@@ -1927,7 +1973,7 @@ mod tests {
 
     #[test]
     fn marking_a_directory_absorbs_marks_below_it() {
-        let root = fixture("absorb", &[("d/a", 10), ("d/b", 20), ("e", 5)]);
+        let root = with_files("absorb", &[("d/a", 10), ("d/b", 20), ("e", 5)]);
         let mut app = app_for(&root);
         let (a, d) = (id(&app, &root, "d/a"), id(&app, &root, "d"));
         app.toggle_mark(a);
@@ -1943,7 +1989,7 @@ mod tests {
     #[test]
     fn vim_keys_walk_the_tree_in_both_panes() {
         // One directory holding everything, as when looking at /home.
-        let root = fixture(
+        let root = with_files(
             "vim",
             &[("only/big", 9000), ("only/mid", 5000), ("only/small", 100)],
         );
@@ -1992,7 +2038,7 @@ mod tests {
 
     #[test]
     fn a_protected_target_stays_locked_until_the_word_is_typed() {
-        let root = fixture(
+        let root = with_files(
             "locked",
             &[
                 ("home/alice/thesis.tex", 4000),
@@ -2073,7 +2119,7 @@ mod tests {
 
     #[test]
     fn a_caution_warns_but_confirms_the_usual_way() {
-        let root = fixture(
+        let root = with_files(
             "caution",
             &[
                 ("home/alice/Documents/notes.txt", 3000),
@@ -2101,7 +2147,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_target_gets_the_plain_dialog() {
-        let root = fixture("plain", &[("home/alice/Documents/old/draft", 3000)]);
+        let root = with_files("plain", &[("home/alice/Documents/old/draft", 3000)]);
         let mut app = app_with_home(&root, "home/alice");
         let old = id(&app, &root, "home/alice/Documents/old");
         app.toggle_mark(old);
@@ -2129,7 +2175,7 @@ mod tests {
             .collect();
         files.push(("home/alice/.ssh/id_ed25519".into(), 100));
         let borrowed: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
-        let root = fixture("buried", &borrowed);
+        let root = with_files("buried", &borrowed);
         let mut app = app_with_home(&root, "home/alice");
         for (path, _) in &files[..24] {
             let node = id(&app, &root, path);
