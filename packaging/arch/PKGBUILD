@@ -1,0 +1,43 @@
+# Arch Linux package for plat, built from this working tree.
+#
+#   cd packaging/arch && makepkg -si
+#
+# This lives in its own directory on purpose: makepkg uses src/ and pkg/ next
+# to the PKGBUILD as scratch space, and the repository root has a src/ of its
+# own.
+
+pkgname=plat
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Disk usage analyser for the terminal, with a nested treemap and guarded batch deletion"
+arch=('x86_64')
+license=('GPL-3.0-or-later')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=(
+  'glib2: move to trash, through gio'
+  'trash-cli: move to trash, through trash-put'
+  'xdg-utils: open with the default application'
+  'wl-clipboard: copy a path where the terminal ignores OSC 52 (Wayland)'
+  'xclip: copy a path where the terminal ignores OSC 52 (X11)'
+)
+# The release profile already strips the binary; there is nothing to split
+# into a debug package.
+options=('!debug')
+source=()
+
+_repo="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../..")"
+
+pkgver() {
+  sed -n 's/^version = "\(.*\)"$/\1/p' "$_repo/Cargo.toml" | head -n 1
+}
+
+build() {
+  cd "$_repo"
+  cargo build --release --locked
+}
+
+package() {
+  install -Dm755 "$_repo/target/release/plat" "$pkgdir/usr/bin/plat"
+  install -Dm644 "$_repo/README.md" "$pkgdir/usr/share/doc/plat/README.md"
+}
