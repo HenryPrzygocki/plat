@@ -46,6 +46,10 @@ pub fn mount(args: &[&str], target: &Path) {
 }
 
 pub fn umount(target: &Path) {
-    let ok = Command::new("umount").arg(target).status().unwrap().success();
+    let ok = Command::new("umount")
+        .arg(target)
+        .status()
+        .unwrap()
+        .success();
     assert!(ok, "could not unmount {}", target.display());
 }

@@ -26,26 +26,64 @@ use crate::fsinfo::{dev_of, is_mount_root};
 /// automount.
 const STAT_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
 
-/// What a mount point inside a doomed directory is told.
-const LEFT_ALONE: &str = "a mount point or subvolume, left alone with everything on it";
-
 fn stat_fd(fd: impl AsFd) -> Result<Statx, Errno> {
     rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)
 }
 
-/// Why something could not be deleted.
+/// Something that could not be deleted, and why.
 #[derive(Debug)]
 pub struct Failure {
     /// The entry that could not be removed.
     pub path: PathBuf,
-    pub reason: String,
+    pub reason: Reason,
+}
+
+/// Why an entry could not be deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// A system call failed.
+    Os(Errno),
+    /// The job was cancelled before this entry was reached.
+    Cancelled,
+    /// A mount point or subvolume, which deletion never enters.
+    Mount,
+    /// Something else is there now than when it was looked at.
+    Changed,
+    /// Entries kept appearing while it was being emptied.
+    KeepsFilling,
+    /// A path with no last component, such as `/`.
+    FilesystemRoot,
+    /// A name no path can hold, because it contains a NUL byte.
+    InvalidName,
+    /// What the trash helper said.
+    Trash(String),
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Reason::Os(Errno::ACCESS | Errno::PERM) => "permission denied",
+            Reason::Os(Errno::BUSY) => "in use (mount point?)",
+            Reason::Os(Errno::ROFS) => "read-only filesystem",
+            Reason::Os(Errno::NOENT) => "no longer exists",
+            Reason::Os(Errno::LOOP | Errno::NOTDIR) | Reason::Changed => "changed since the scan",
+            Reason::Os(e) => return write!(f, "{}", io::Error::from(*e)),
+            Reason::Cancelled => "cancelled",
+            Reason::Mount => "a mount point or subvolume, left alone with everything on it",
+            Reason::KeepsFilling => "directory keeps filling up",
+            Reason::FilesystemRoot => "refusing to delete a filesystem root",
+            Reason::InvalidName => "invalid name",
+            Reason::Trash(text) => text,
+        };
+        f.write_str(text)
+    }
 }
 
 impl Failure {
-    fn at(name: &CStr, reason: impl Into<String>) -> Failure {
+    fn at(name: &CStr, reason: Reason) -> Failure {
         Failure {
             path: PathBuf::from(OsStr::from_bytes(name.to_bytes())),
-            reason: reason.into(),
+            reason,
         }
     }
 
@@ -53,17 +91,6 @@ impl Failure {
     fn inside(mut self, dir: &CStr) -> Failure {
         self.path = Path::new(OsStr::from_bytes(dir.to_bytes())).join(&self.path);
         self
-    }
-}
-
-fn describe(e: Errno) -> String {
-    match e {
-        Errno::ACCESS | Errno::PERM => "permission denied".into(),
-        Errno::BUSY => "in use (mount point?)".into(),
-        Errno::ROFS => "read-only filesystem".into(),
-        Errno::NOENT => "no longer exists".into(),
-        Errno::LOOP | Errno::NOTDIR => "changed since the scan".into(),
-        other => io::Error::from(other).to_string(),
     }
 }
 
@@ -99,16 +126,16 @@ fn open_beneath_root(path: &Path) -> Result<OwnedFd, Errno> {
 /// `path` must be absolute and free of symlinks, `.` and `..`, which holds for
 /// every path that comes out of a scan.
 pub fn remove(path: &Path, counters: &Counters) -> Result<(), Failure> {
-    let whole = |reason: String| Failure {
+    let whole = |reason: Reason| Failure {
         path: path.to_path_buf(),
         reason,
     };
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(whole("refusing to delete a filesystem root".into()));
+        return Err(whole(Reason::FilesystemRoot));
     };
-    let name = CString::new(name.as_bytes()).map_err(|_| whole("invalid name".into()))?;
-    let dir = open_beneath_root(parent).map_err(|e| whole(describe(e)))?;
-    let dev = dev_of(&stat_fd(&dir).map_err(|e| whole(describe(e)))?);
+    let name = CString::new(name.as_bytes()).map_err(|_| whole(Reason::InvalidName))?;
+    let dir = open_beneath_root(parent).map_err(|e| whole(Reason::Os(e)))?;
+    let dev = dev_of(&stat_fd(&dir).map_err(|e| whole(Reason::Os(e)))?);
     remove_entry(dir.as_fd(), &name, dev, counters).map_err(|f| Failure {
         // Report the full path of whatever was in the way.
         path: parent.join(f.path),
@@ -124,7 +151,7 @@ fn remove_entry(
     counters: &Counters,
 ) -> Result<(), Failure> {
     if counters.cancel.load(Relaxed) {
-        return Err(Failure::at(name, "cancelled"));
+        return Err(Failure::at(name, Reason::Cancelled));
     }
     // Unlinking a directory fails with EISDIR, so files cost one system call
     // and need no stat first. A symlink is removed itself, never followed.
@@ -134,7 +161,7 @@ fn remove_entry(
             Ok(())
         }
         Err(Errno::ISDIR) => remove_dir(parent, name, dev, counters),
-        Err(e) => Err(Failure::at(name, describe(e))),
+        Err(e) => Err(Failure::at(name, Reason::Os(e))),
     }
 }
 
@@ -144,74 +171,85 @@ fn remove_dir(
     dev: u64,
     counters: &Counters,
 ) -> Result<(), Failure> {
-    let fail = |e: Errno| Failure::at(name, describe(e));
+    let fail = |e: Errno| Failure::at(name, Reason::Os(e));
     // Look before opening: opening an automount point would mount it. A
     // bind mount keeps the device number of where it comes from, so the
     // device alone does not show every mount.
-    let seen = rustix::fs::statx(parent, name, STAT_FLAGS, StatxFlags::BASIC_STATS).map_err(fail)?;
+    let seen =
+        rustix::fs::statx(parent, name, STAT_FLAGS, StatxFlags::BASIC_STATS).map_err(fail)?;
     if dev_of(&seen) != dev || is_mount_root(&seen) {
-        return Err(Failure::at(name, LEFT_ALONE));
+        return Err(Failure::at(name, Reason::Mount));
     }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = rustix::fs::openat(parent, name, flags, Mode::empty()).map_err(fail)?;
     // And check that what was opened is what was looked at.
     let st = stat_fd(&fd).map_err(fail)?;
     if (dev_of(&st), st.stx_ino) != (dev, seen.stx_ino) || is_mount_root(&st) {
-        return Err(Failure::at(name, describe(Errno::NOTDIR)));
+        return Err(Failure::at(name, Reason::Changed));
     }
 
-    let mut first_failure: Option<Failure> = None;
-    let mut made_writable = false;
-    // Removing entries while reading a directory can make the reader skip
-    // some, so go round again if the directory turns out not to be empty.
-    for _ in 0..4 {
-        let mut reader = Dir::read_from(&fd).map_err(fail)?;
-        while let Some(entry) = reader.read() {
-            let entry = entry.map_err(fail)?;
-            let child = entry.file_name();
-            if child == c"." || child == c".." {
-                continue;
-            }
-            let attempt = |counters: &Counters| {
-                if entry.file_type() == FileType::Directory {
-                    remove_dir(fd.as_fd(), child, dev, counters)
-                } else {
-                    remove_entry(fd.as_fd(), child, dev, counters)
+    // Directories without write permission are common in caches (Go
+    // modules, for one). If this one is ours, it is made writable for as
+    // long as it takes, and put back as it was if it ends up staying.
+    let mode = Mode::from_raw_mode(st.stx_mode as u32);
+    let (mut tried, mut unlocked) = (false, false);
+    let mut empty_and_remove = || {
+        let mut first_failure: Option<Failure> = None;
+        // Removing entries while reading a directory can make the reader
+        // skip some, so go round again if it turns out not to be empty.
+        for _ in 0..4 {
+            let mut reader = Dir::read_from(&fd).map_err(fail)?;
+            while let Some(entry) = reader.read() {
+                let entry = entry.map_err(fail)?;
+                let child = entry.file_name();
+                if child == c"." || child == c".." {
+                    continue;
                 }
-            };
-            let mut result = attempt(counters);
-            if let Err(f) = &result {
-                // Directories without write permission are common in caches
-                // (Go modules, for one). If the directory is ours to change,
-                // make it writable and try once more.
-                if f.reason == "permission denied"
-                    && !made_writable
+                let attempt = |counters: &Counters| {
+                    if entry.file_type() == FileType::Directory {
+                        remove_dir(fd.as_fd(), child, dev, counters)
+                    } else {
+                        remove_entry(fd.as_fd(), child, dev, counters)
+                    }
+                };
+                let mut result = attempt(counters);
+                // EACCES on an entry of this directory is what a missing
+                // write permission here gives. EPERM (immutable files, sticky
+                // directories) is not something a chmod can help with.
+                if let Err(f) = &result
+                    && f.reason == Reason::Os(Errno::ACCESS)
                     && f.path.components().count() == 1
+                    && !tried
                 {
-                    made_writable = true;
-                    let mode = Mode::from_raw_mode(st.stx_mode as u32) | Mode::RWXU;
-                    if rustix::fs::fchmod(&fd, mode).is_ok() {
+                    tried = true;
+                    unlocked = rustix::fs::fchmod(&fd, mode | Mode::RWXU).is_ok();
+                    if unlocked {
                         result = attempt(counters);
                     }
                 }
-            }
-            if let Err(f) = result {
-                if f.reason == "cancelled" {
-                    return Err(f.inside(name));
+                if let Err(f) = result {
+                    if f.reason == Reason::Cancelled {
+                        return Err(f.inside(name));
+                    }
+                    first_failure.get_or_insert(f.inside(name));
                 }
-                first_failure.get_or_insert(f.inside(name));
+            }
+            match rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR) {
+                Ok(()) => {
+                    counters.removed.fetch_add(1, Relaxed);
+                    return Ok(());
+                }
+                Err(Errno::NOTEMPTY | Errno::EXIST) if first_failure.is_none() => continue,
+                Err(e) => return Err(first_failure.unwrap_or_else(|| fail(e))),
             }
         }
-        match rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR) {
-            Ok(()) => {
-                counters.removed.fetch_add(1, Relaxed);
-                return Ok(());
-            }
-            Err(Errno::NOTEMPTY | Errno::EXIST) if first_failure.is_none() => continue,
-            Err(e) => return Err(first_failure.unwrap_or_else(|| fail(e))),
-        }
+        Err(first_failure.unwrap_or_else(|| Failure::at(name, Reason::KeepsFilling)))
+    };
+    let result = empty_and_remove();
+    if result.is_err() && unlocked {
+        let _ = rustix::fs::fchmod(&fd, mode);
     }
-    Err(first_failure.unwrap_or_else(|| Failure::at(name, "directory keeps filling up")))
+    result
 }
 
 /// A program that moves files to the desktop trash.
@@ -248,7 +286,7 @@ pub fn trash(path: &Path, tool: TrashTool) -> Result<(), Failure> {
     };
     let fail = |reason: String| Failure {
         path: path.to_path_buf(),
-        reason,
+        reason: Reason::Trash(reason),
     };
     let out = cmd
         .arg(path)
@@ -434,8 +472,33 @@ mod tests {
 
         // Same file, but reached through a symlinked directory.
         let err = remove(&root.join("alias/inner"), &Counters::default()).unwrap_err();
-        assert_eq!(err.reason, "changed since the scan");
+        assert_eq!(err.reason.to_string(), "changed since the scan");
         assert!(real.join("inner/file").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn permissions_are_put_back_when_a_directory_stays() {
+        if crate::fsinfo::is_root() {
+            return; // root opens anything, so nothing would stay
+        }
+        // `locked` can only be emptied after a chmod, and still cannot be,
+        // because `sealed` inside it cannot even be opened.
+        let root = scratch("restore");
+        let locked = root.join("victim/locked");
+        fs::create_dir_all(locked.join("sealed")).unwrap();
+        fs::write(locked.join("sealed/file"), b"x").unwrap();
+        let set = |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode));
+        set(&locked.join("sealed"), 0o000).unwrap();
+        set(&locked, 0o555).unwrap();
+
+        let err = remove(&root.join("victim"), &Counters::default()).unwrap_err();
+        assert_eq!(err.path, locked.join("sealed"));
+        let mode = fs::metadata(&locked).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555, "left at {mode:o}");
+
+        set(&locked.join("sealed"), 0o755).unwrap();
+        set(&locked, 0o755).unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -473,13 +536,13 @@ mod tests {
         // rest is removed.
         let err = remove(&victim, &Counters::default()).unwrap_err();
         assert_eq!(err.path, mnt);
-        assert_eq!(err.reason, LEFT_ALONE);
+        assert_eq!(err.reason, Reason::Mount);
         assert_eq!(fs::read(mnt.join("inner/sentinel")).unwrap(), b"alive");
         assert!(!victim.join("plain").exists());
 
         // The mount point itself as the item.
         let err = remove(&mnt, &Counters::default()).unwrap_err();
-        assert_eq!(err.reason, LEFT_ALONE);
+        assert_eq!(err.reason, Reason::Mount);
         assert_eq!(fs::read(mnt.join("inner/sentinel")).unwrap(), b"alive");
 
         umount(&mnt);
@@ -510,7 +573,11 @@ mod tests {
 
         // The bind mount itself as the item.
         let err = remove(&alias, &Counters::default()).unwrap_err();
-        assert!(err.reason.to_string().contains("mount point"), "{}", err.reason);
+        assert!(
+            err.reason.to_string().contains("mount point"),
+            "{}",
+            err.reason
+        );
         assert_eq!(fs::read(real.join("inner/sentinel")).unwrap(), b"alive");
 
         umount(&alias);
@@ -545,7 +612,7 @@ mod tests {
         // A path that cannot be trashed reports why.
         let err = trash(&dir.join("does-not-exist"), tool).unwrap_err();
         assert!(
-            !err.reason.is_empty() && !err.reason.contains("file://"),
+            !err.reason.to_string().is_empty() && !err.reason.to_string().contains("file://"),
             "{}",
             err.reason
         );
@@ -556,7 +623,8 @@ mod tests {
         let root = scratch("missing");
         let err = remove(&root.join("nope"), &Counters::default()).unwrap_err();
         assert_eq!(err.path, root.join("nope"));
-        assert_eq!(err.reason, "no longer exists");
+        assert_eq!(err.reason, Reason::Os(Errno::NOENT));
+        assert_eq!(err.reason.to_string(), "no longer exists");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -569,7 +637,7 @@ mod tests {
         let counters = Counters::default();
         counters.cancel.store(true, Relaxed);
         let err = remove(&victim, &counters).unwrap_err();
-        assert_eq!(err.reason, "cancelled");
+        assert_eq!(err.reason, Reason::Cancelled);
         assert!(victim.join("file").exists());
         fs::remove_dir_all(&root).unwrap();
     }

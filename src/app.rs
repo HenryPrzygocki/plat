@@ -1159,7 +1159,7 @@ impl App {
             match outcomes.next() {
                 Some(Outcome::Skipped) => skipped += 1,
                 Some(Outcome::Failed(f)) => {
-                    failures.push((f.path.display().to_string(), f.reason));
+                    failures.push((f.path.display().to_string(), f.reason.to_string()));
                     if exists && item.is_dir {
                         rescans.push(item.path.clone());
                     }

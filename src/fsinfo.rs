@@ -112,7 +112,8 @@ pub fn dev_of(stx: &Statx) -> u64 {
 /// Kernels before 5.8 do not report the attribute; there only a change of
 /// device marks a mount.
 pub fn is_mount_root(stx: &Statx) -> bool {
-    stx.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT)
+    stx.stx_attributes_mask
+        .contains(StatxAttributes::MOUNT_ROOT)
         && stx.stx_attributes.contains(StatxAttributes::MOUNT_ROOT)
 }
 
