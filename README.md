@@ -127,7 +127,8 @@ move to trash, or delete permanently.
   mounts, which share the device number of where they come from and are
   recognised by asking the kernel whether a directory is a mount root.
 - Read-only directories you own (Go's module cache, for one) are made
-  writable and removed, where `rm -rf` would stop.
+  writable and removed, where `rm -rf` would stop. One that cannot be
+  removed after all gets its old permissions back.
 - If part of a directory cannot be removed, a report names what was in the
   way, and the directory is rescanned so the display matches the disk.
 
@@ -195,7 +196,11 @@ directories are read from `/etc/passwd`. Paths are compared by component, so
 - On btrfs, snapshots are counted at full size, because shared extents cannot
   be told apart by `stat`.
 - Only the first link to a multiply-linked file is counted; the others show
-  as zero-sized hard links.
+  as zero-sized hard links. Rescanning one directory counts links afresh, so
+  a file linked both inside and outside it can be counted twice until the
+  next full scan.
+- A directory whose path is longer than 4096 bytes cannot be opened by path,
+  and shows as unreadable.
 - Sizes of directories that could not be fully read are lower bounds.
 
 ## Development
