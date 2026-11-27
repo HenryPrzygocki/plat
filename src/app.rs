@@ -278,6 +278,8 @@ pub struct App {
     pub scan_time: Duration,
     /// Unreadable directories in the last full scan.
     pub scan_errors: u64,
+    /// Why there is nothing to show, once the initial scan has failed.
+    fatal: Option<String>,
     /// Bumped whenever the tree or anything derived from it changes.
     generation: u64,
 
@@ -340,6 +342,7 @@ impl App {
             scan: None,
             scan_time: Duration::ZERO,
             scan_errors: 0,
+            fatal: None,
             generation: 0,
             view: Tree::ROOT,
             cursor: NONE,
@@ -390,7 +393,7 @@ impl App {
                 let _ = tx.send(scan::scan(&p, o, &pr));
             });
         if spawned.is_err() {
-            self.toast("could not start a scanner thread", ToastKind::Error);
+            self.error("could not start a scanner thread");
             return;
         }
         self.scan = Some(ScanJob {
@@ -455,10 +458,7 @@ impl App {
                 self.install(r);
             }
             (Ok((meta, raw)), Some(path)) => self.install_refresh(&path, meta, raw),
-            (Err(e), None) => {
-                // Nothing to show without a tree; the event loop reports this.
-                self.toast(format!("{}: {e}", job.path.display()), ToastKind::Error);
-            }
+            (Err(e), None) => self.error(format!("{}: {e}", job.path.display())),
             (Err(e), Some(path)) => {
                 self.toast(format!("{}: {e}", path.display()), ToastKind::Error);
             }
@@ -484,10 +484,16 @@ impl App {
 
     /// The initial scan failed and there is nothing to show.
     pub fn failed(&self) -> Option<&str> {
-        if self.tree.is_none() && self.scan.is_none() {
-            self.toast.as_ref().map(|t| t.text.as_str())
+        self.fatal.as_deref()
+    }
+
+    /// Report an error: on the status line, or, while there is no tree to
+    /// show at all, as the reason the session ends.
+    fn error(&mut self, text: impl Into<String>) {
+        if self.tree.is_none() {
+            self.fatal = Some(text.into());
         } else {
-            None
+            self.toast(text, ToastKind::Error);
         }
     }
 
@@ -500,7 +506,7 @@ impl App {
                 self.cursor = NONE;
                 self.changed();
             }
-            Err(_) => self.toast("too many files for one scan", ToastKind::Error),
+            Err(_) => self.error("too many files for one scan"),
         }
         scan::release_memory();
     }
@@ -1292,8 +1298,7 @@ impl App {
         }
     }
 
-    /// The directory a shell should start in: the active directory, or the
-    /// one holding the active file.
+    /// The directory a shell should start in: the one on view.
     fn shell_dir(&self) -> Option<PathBuf> {
         let tree = self.tree.as_ref()?;
         Some(tree.path(self.view))
@@ -1634,14 +1639,14 @@ fn trash_dir() -> Option<PathBuf> {
     Some(data.join("Trash"))
 }
 
-/// Case-insensitive name order with a case-sensitive tie break.
+/// Case-insensitive name order with a case-sensitive tie break. Called
+/// n log n times per sort, so it compares in place instead of allocating
+/// folded copies.
 fn cmp_names(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-    let fold = |s: &[u8]| {
-        s.iter()
-            .map(|c| c.to_ascii_lowercase())
-            .collect::<Vec<u8>>()
-    };
-    fold(a).cmp(&fold(b)).then_with(|| a.cmp(b))
+    a.iter()
+        .map(u8::to_ascii_lowercase)
+        .cmp(b.iter().map(u8::to_ascii_lowercase))
+        .then_with(|| a.cmp(b))
 }
 
 #[cfg(test)]
@@ -1852,6 +1857,20 @@ mod tests {
         assert!(before - after >= 71_000, "freed {} bytes", before - after);
         assert_consistent(&app, &root);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_first_scan_ends_the_session_with_its_reason() {
+        let gone = crate::testutil::scratch("fatal").join("does-not-exist");
+        let mut app = App::new(gone, scan::Options::default(), Theme::new(true));
+        assert_eq!(app.failed(), None);
+        app.start_scan(None);
+        app.settle();
+        assert!(
+            app.failed().is_some_and(|m| m.contains("does-not-exist")),
+            "{:?}",
+            app.failed()
+        );
     }
 
     /// Events that arrive together are all handled before the next frame, so

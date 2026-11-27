@@ -29,7 +29,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::{DefaultTerminal, Terminal};
 
-use app::{App, Effect};
+use app::{App, Effect, ToastKind};
 use theme::Theme;
 
 struct Args {
@@ -257,8 +257,10 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-/// Leave the interface, run the user's shell in `dir`, and come back.
-fn run_shell(terminal: &mut DefaultTerminal, dir: &Path) -> io::Result<()> {
+/// Leave the interface, run the user's shell in `dir`, and come back. The
+/// outer error is about the terminal, which ends the session; the inner one
+/// says the shell could not be started, which is only worth a message.
+fn run_shell(terminal: &mut DefaultTerminal, dir: &Path) -> io::Result<Result<(), String>> {
     disable_mouse();
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen, Show)?;
@@ -272,7 +274,9 @@ fn run_shell(terminal: &mut DefaultTerminal, dir: &Path) -> io::Result<()> {
     // repaints everything. `Terminal::clear` would do that too, but it first
     // asks the terminal where the cursor is and fails if no answer comes.
     *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    status.map(|_| ())
+    Ok(status
+        .map(|_| ())
+        .map_err(|e| format!("could not start {}: {e}", shell.to_string_lossy())))
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
@@ -311,10 +315,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                 Effect::None => {}
                 Effect::Quit => return Ok(()),
                 Effect::Copy(text) => copy_to_clipboard(&text),
-                Effect::Shell(dir) => {
-                    run_shell(terminal, &dir)?;
-                    app.after_shell();
-                }
+                Effect::Shell(dir) => match run_shell(terminal, &dir)? {
+                    Ok(()) => app.after_shell(),
+                    Err(message) => app.toast(message, ToastKind::Error),
+                },
             }
             // Handle everything already queued before redrawing.
             if !event::poll(Duration::ZERO)? {
