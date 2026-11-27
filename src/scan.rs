@@ -20,7 +20,7 @@ use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, StatxFlags};
 
 use crate::ext;
 use crate::fsinfo::{self, FsClass, dev_of};
-use crate::tree::flag;
+use crate::tree::{self, flag};
 
 /// Marker for "this entry has no scanned subdirectory".
 pub const NO_SUB: u32 = u32::MAX;
@@ -46,7 +46,7 @@ pub struct Progress {
 /// One scanned directory: its direct entries plus the scanned subdirectories.
 #[derive(Default)]
 pub struct RawDir {
-    /// Entry names, concatenated.
+    /// Entry names, concatenated, as written by [`tree::push_name`].
     pub names: Vec<u8>,
     pub entries: Vec<RawEntry>,
     /// Scanned subdirectories, referenced by `RawEntry::sub`.
@@ -176,18 +176,18 @@ fn scan_dir(path: &Path, dev: Option<u64>, ctx: &Ctx) -> RawDir {
         if name == b"." || name == b".." {
             continue;
         }
+        let name_off = out.names.len() as u32;
+        let name_len = tree::push_name(&mut out.names, name);
         out.entries.push(RawEntry {
             size: 0,
             disk: 0,
             mtime: 0,
-            name_off: out.names.len() as u32,
+            name_off,
             sub: NO_SUB,
             ext: ext::EXT_NONE,
-            // NAME_MAX is 255 on Linux, so this never truncates in practice.
-            name_len: name.len().min(255) as u8,
+            name_len,
             flags: flag::FILE,
         });
-        out.names.extend_from_slice(&name[..name.len().min(255)]);
     }
     if failed {
         if out.entries.is_empty() {
@@ -216,8 +216,7 @@ fn scan_dir(path: &Path, dev: Option<u64>, ctx: &Ctx) -> RawDir {
     let mut files = 0u64;
     let mut bytes = 0u64;
     for (index, e) in out.entries.iter_mut().enumerate() {
-        let start = e.name_off as usize;
-        let name = &out.names[start..start + e.name_len as usize];
+        let name = tree::name_at(&out.names, e.name_off, e.name_len);
         let name_os = OsStr::from_bytes(name);
         let stx = match rustix::fs::statx(dirfd, name_os, STAT_FLAGS, StatxFlags::BASIC_STATS) {
             Ok(stx) => stx,
@@ -303,10 +302,9 @@ fn scan_dir(path: &Path, dev: Option<u64>, ctx: &Ctx) -> RawDir {
     if !pending.is_empty() {
         let child_path = |idx: u32| -> PathBuf {
             let e = &out.entries[idx as usize];
-            let start = e.name_off as usize;
-            path.join(OsStr::from_bytes(
-                &out.names[start..start + e.name_len as usize],
-            ))
+            path.join(OsStr::from_bytes(tree::name_at(
+                &out.names, e.name_off, e.name_len,
+            )))
         };
         let subdirs: Vec<RawDir> = if pending.len() == 1 {
             vec![scan_dir(&child_path(pending[0].0), pending[0].1, ctx)]
@@ -531,10 +529,16 @@ mod tests {
             fs::create_dir(root.join(d)).unwrap();
         }
         fs::write(root.join("real/data"), vec![1u8; 40_000]).unwrap();
-        mount(&["--bind", root.join("real").to_str().unwrap()], &root.join("bind"));
+        mount(
+            &["--bind", root.join("real").to_str().unwrap()],
+            &root.join("bind"),
+        );
         mount(&["-t", "tmpfs", "none"], &root.join("ram"));
         fs::write(root.join("ram/inside"), vec![1u8; 9_000]).unwrap();
-        mount(&["--bind", root.join("ram").to_str().unwrap()], &root.join("ram-again"));
+        mount(
+            &["--bind", root.join("ram").to_str().unwrap()],
+            &root.join("ram-again"),
+        );
         let run = |opts: Options| {
             let progress = Progress::default();
             let (meta, raw) = scan(&root, opts, &progress).unwrap();
@@ -550,7 +554,11 @@ mod tests {
         // device number, but it is a mount all the same, and not entered.
         let tree = run(Options::default());
         let bind = node(&tree, &root, "bind");
-        assert!(bind.has(flag::MOUNT) && bind.has(flag::SKIPPED), "{:#x}", bind.flags);
+        assert!(
+            bind.has(flag::MOUNT) && bind.has(flag::SKIPPED),
+            "{:#x}",
+            bind.flags
+        );
         assert_eq!(fsinfo::fs_name(bind.ext), "bind");
         assert_eq!(named(&tree, b"data"), 1);
 

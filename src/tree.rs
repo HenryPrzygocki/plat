@@ -19,6 +19,44 @@ use crate::scan::{NO_SUB, RawDir, RawEntry, RootMeta};
 
 pub type NodeId = u32;
 
+/// Length byte of a name too long to fit in it. Such a name is stored with
+/// its length in two bytes in front. Linux limits names to 255 bytes on most
+/// filesystems, but vfat, exFAT and NTFS allow 255 UTF-16 units, which can
+/// come to over 700 bytes of UTF-8.
+const LONG_NAME: u8 = u8::MAX;
+
+/// Append `name` to a name pool. Returns the length byte to store with it.
+pub fn push_name(pool: &mut Vec<u8>, name: &[u8]) -> u8 {
+    if name.len() < LONG_NAME as usize {
+        pool.extend_from_slice(name);
+        return name.len() as u8;
+    }
+    // Far beyond anything a filesystem hands out, but never silently wrong.
+    let len = name.len().min(u16::MAX as usize);
+    pool.extend_from_slice(&(len as u16).to_le_bytes());
+    pool.extend_from_slice(&name[..len]);
+    LONG_NAME
+}
+
+/// The bytes a name takes up in its pool, length prefix included.
+#[inline]
+fn stored(pool: &[u8], off: u32, len: u8) -> std::ops::Range<usize> {
+    let off = off as usize;
+    if len < LONG_NAME {
+        off..off + len as usize
+    } else {
+        off..off + 2 + u16::from_le_bytes([pool[off], pool[off + 1]]) as usize
+    }
+}
+
+/// The name stored at `off` with length byte `len`.
+#[inline]
+pub fn name_at(pool: &[u8], off: u32, len: u8) -> &[u8] {
+    let range = stored(pool, off, len);
+    let skip = if len < LONG_NAME { 0 } else { 2 };
+    &pool[range.start + skip..range.end]
+}
+
 /// Node flag bits. The low two bits hold the kind.
 pub mod flag {
     pub const FILE: u8 = 0;
@@ -121,6 +159,8 @@ pub enum BuildError {
 pub struct Tree {
     nodes: Vec<Node>,
     names: Vec<u8>,
+    /// Bytes of `names` that no node refers to any more.
+    dead_names: usize,
     root: PathBuf,
 }
 
@@ -153,7 +193,12 @@ impl Tree {
             flags,
         });
         emit(raw, Tree::ROOT, &mut nodes, &mut names);
-        Ok(Tree { nodes, names, root })
+        Ok(Tree {
+            nodes,
+            names,
+            dead_names: 0,
+            root,
+        })
     }
 
     #[inline]
@@ -181,8 +226,7 @@ impl Tree {
     #[inline]
     pub fn name(&self, id: NodeId) -> &[u8] {
         let n = &self.nodes[id as usize];
-        let start = n.name_off as usize;
-        &self.names[start..start + n.name_len as usize]
+        name_at(&self.names, n.name_off, n.name_len)
     }
 
     /// Children of a directory, largest first.
@@ -203,17 +247,7 @@ impl Tree {
 
     /// Exact filesystem path of a node, built from raw name bytes.
     pub fn path(&self, id: NodeId) -> PathBuf {
-        let mut chain = Vec::new();
-        let mut cur = id;
-        while cur != Tree::ROOT {
-            chain.push(cur);
-            cur = self.nodes[cur as usize].parent;
-        }
-        let mut path = self.root.clone();
-        for &c in chain.iter().rev() {
-            path.push(OsStr::from_bytes(self.name(c)));
-        }
-        path
+        self.root.join(self.rel_path(id, Tree::ROOT))
     }
 
     /// Path of a node relative to `base`, which must be the node or one of its
@@ -263,6 +297,7 @@ impl Tree {
         }
 
         for &(start, end) in &ranges {
+            self.dead_names += self.name_bytes(start..end);
             let gone = self.nodes[start as usize];
             let count = end - start;
             let mut cur = gone.parent;
@@ -282,6 +317,13 @@ impl Tree {
             remap.cuts.push((start, end, -removed));
         }
 
+        // Their parents survive, and may no longer hold anything unreadable.
+        let mut parents: Vec<NodeId> = ranges
+            .iter()
+            .filter_map(|&(start, _)| remap.map(self.nodes[start as usize].parent))
+            .collect();
+        parents.dedup();
+
         let mut out = Vec::with_capacity(self.nodes.len() - removed as usize);
         let mut pos = 0u32;
         for &(start, end) in &ranges {
@@ -297,6 +339,10 @@ impl Tree {
             }
         }
         self.nodes = out;
+        for p in parents {
+            self.refresh_partial(p);
+        }
+        self.reclaim_names();
         remap
     }
 
@@ -320,6 +366,7 @@ impl Tree {
         let new_size = meta.size + raw.size;
         let new_disk = meta.disk + raw.disk;
 
+        self.dead_names += self.name_bytes(id + 1..old_end);
         let mut out = Vec::with_capacity(new_total as usize);
         out.extend_from_slice(&self.nodes[..=id as usize]);
         {
@@ -352,9 +399,55 @@ impl Tree {
             cur = n.parent;
         }
         self.nodes = out;
+        self.refresh_partial(self.nodes[id as usize].parent);
+        self.reclaim_names();
         Ok(Remap {
             cuts: vec![(id + 1, old_end, shift)],
         })
+    }
+
+    /// Pool bytes taken by the names of the nodes in `ids`.
+    fn name_bytes(&self, ids: std::ops::Range<NodeId>) -> usize {
+        self.nodes[ids.start as usize..ids.end as usize]
+            .iter()
+            .map(|n| stored(&self.names, n.name_off, n.name_len).len())
+            .sum()
+    }
+
+    /// Recompute whether `dir` and its ancestors hold anything unreadable,
+    /// after something below `dir` changed. Stops at the first directory
+    /// whose answer stays the same, since nothing above it can change then.
+    fn refresh_partial(&mut self, dir: NodeId) {
+        let mut cur = dir;
+        while cur != NodeId::MAX {
+            let n = self.nodes[cur as usize];
+            let partial = n.has(flag::ERR)
+                || self
+                    .children(cur)
+                    .any(|c| self.nodes[c as usize].has(flag::ERR | flag::PARTIAL));
+            if partial == n.has(flag::PARTIAL) {
+                return;
+            }
+            self.nodes[cur as usize].flags ^= flag::PARTIAL;
+            cur = n.parent;
+        }
+    }
+
+    /// Rescans and deletions leave the old names behind in the pool. Once
+    /// they outweigh the live ones, copy the live names into a fresh pool:
+    /// linear in the tree, and amortised over at least as many dead bytes.
+    fn reclaim_names(&mut self) {
+        if self.dead_names * 2 <= self.names.len() {
+            return;
+        }
+        let mut names = Vec::with_capacity(self.names.len() - self.dead_names);
+        for n in &mut self.nodes {
+            let range = stored(&self.names, n.name_off, n.name_len);
+            n.name_off = names.len() as u32;
+            names.extend_from_slice(&self.names[range]);
+        }
+        self.names = names;
+        self.dead_names = 0;
     }
 }
 
@@ -398,10 +491,7 @@ fn emit(dir: RawDir, parent: NodeId, nodes: &mut Vec<Node>, names: &mut Vec<u8>)
         names.extend_from_slice(&dir.names);
         let entries = dir.entries;
         let dir_names = &dir.names;
-        let name_of = |e: &RawEntry| {
-            let s = e.name_off as usize;
-            &dir_names[s..s + e.name_len as usize]
-        };
+        let name_of = |e: &RawEntry| name_at(dir_names, e.name_off, e.name_len);
         let mut order: Vec<u32> = (0..entries.len() as u32).collect();
         order.sort_unstable_by(|&a, &b| {
             let (ea, eb) = (&entries[a as usize], &entries[b as usize]);
@@ -444,5 +534,131 @@ fn emit(dir: RawDir, parent: NodeId, nodes: &mut Vec<Node>, names: &mut Vec<u8>)
         if let Some(sub) = sub {
             stack.push(open(sub, id, names));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{Options, Progress, scan};
+    use crate::testutil::{scratch, with_files};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scan_of(path: &Path) -> (RootMeta, RawDir) {
+        scan(path, Options::default(), &Progress::default()).unwrap()
+    }
+
+    #[test]
+    fn names_of_every_length_survive() {
+        // Longer than any name Linux filesystems create natively, so build
+        // the scan result by hand.
+        let mut raw = RawDir::default();
+        let lengths = [0usize, 1, 254, 255, 256, 765, 70_000];
+        let names: Vec<Vec<u8>> = lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| (0..len).map(|k| b'a' + ((i + k) % 26) as u8).collect())
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            let name_off = raw.names.len() as u32;
+            let name_len = push_name(&mut raw.names, name);
+            raw.entries.push(RawEntry {
+                size: 1000 - i as u64,
+                disk: 1000 - i as u64,
+                mtime: 0,
+                name_off,
+                sub: NO_SUB,
+                ext: 0,
+                name_len,
+                flags: flag::FILE,
+            });
+        }
+        raw.count = names.len() as u64;
+        raw.name_bytes = raw.names.len() as u64;
+        let meta = RootMeta {
+            size: 0,
+            disk: 0,
+            mtime: 0,
+        };
+        let tree = Tree::build(PathBuf::from("/r"), meta, raw).unwrap();
+        for (i, name) in names.iter().enumerate() {
+            let id = i as NodeId + 1;
+            let want = &name[..name.len().min(u16::MAX as usize)];
+            assert_eq!(tree.name(id), want, "name of {} bytes", name.len());
+        }
+        let long = Path::new("/r").join(OsStr::from_bytes(&names[5]));
+        assert_eq!(tree.find(&long), Some(6));
+        assert_eq!(tree.path(6), long);
+    }
+
+    #[test]
+    fn rescans_do_not_grow_the_name_pool() {
+        let files: Vec<(String, usize)> = (0..200).map(|i| (format!("d/f{i:03}"), 10)).collect();
+        let files: Vec<(&str, usize)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let root = with_files("pool", &files);
+        let (meta, raw) = scan_of(&root);
+        let mut tree = Tree::build(root.clone(), meta, raw).unwrap();
+        let live = tree.names.len();
+        for _ in 0..20 {
+            let d = tree.find(&root.join("d")).unwrap();
+            let (meta, raw) = scan_of(&root.join("d"));
+            tree.replace(d, meta, raw).unwrap();
+            assert!(
+                tree.names.len() <= 2 * live + 16,
+                "{} bytes",
+                tree.names.len()
+            );
+        }
+        // Every name still reads back.
+        let d = tree.find(&root.join("d")).unwrap();
+        assert_eq!(tree.children(d).count(), 200);
+        assert!(tree.find(&root.join("d/f123")).is_some());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_flags_follow_rescans_up_the_tree() {
+        if crate::fsinfo::is_root() {
+            return; // root reads everything, so nothing is ever partial
+        }
+        let root = scratch("partial");
+        fs::create_dir_all(root.join("a/b/locked")).unwrap();
+        fs::write(root.join("a/b/locked/f"), b"x").unwrap();
+        fs::write(root.join("a/b/fine"), b"x").unwrap();
+        let lock = |mode| {
+            fs::set_permissions(root.join("a/b/locked"), fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let partial = |tree: &Tree, rel: &str| {
+            let id = tree.find(&root.join(rel)).unwrap();
+            tree.node(id).has(flag::PARTIAL)
+        };
+        let rescan = |tree: &mut Tree, rel: &str| {
+            let id = tree.find(&root.join(rel)).unwrap();
+            let (meta, raw) = scan_of(&root.join(rel));
+            tree.replace(id, meta, raw).unwrap();
+        };
+        let (meta, raw) = scan_of(&root);
+        let mut tree = Tree::build(root.clone(), meta, raw).unwrap();
+        assert!(!partial(&tree, "a"));
+
+        // Something becomes unreadable: everything above it says so.
+        lock(0o000);
+        rescan(&mut tree, "a/b");
+        assert!(partial(&tree, "a/b") && partial(&tree, "a") && partial(&tree, ""));
+
+        // And stops saying so once it can be read again.
+        lock(0o755);
+        rescan(&mut tree, "a/b");
+        assert!(!partial(&tree, "a/b") && !partial(&tree, "a") && !partial(&tree, ""));
+
+        // Deleting the unreadable part has the same effect.
+        lock(0o000);
+        rescan(&mut tree, "a/b");
+        let locked = tree.find(&root.join("a/b/locked")).unwrap();
+        tree.remove(&[locked]);
+        assert!(!partial(&tree, "a/b") && !partial(&tree, "a") && !partial(&tree, ""));
+        lock(0o755);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
